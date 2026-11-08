@@ -5,7 +5,15 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync,
 import { tmpdir } from 'os';
 import { dirname, join } from 'path';
 import type { spawn } from 'child_process';
-import { codexModelForLogin, GEMINI_NO_MCP_SERVERS, runAgentTask, type AgentTask } from '../../../src/services/agent-runner/run.js';
+import {
+  clearCodexWindowsConfinementMemory,
+  CODEX_WINDOWS_CONFINEMENT_SETUP_MESSAGE,
+  CODEX_WINDOWS_CONFINEMENT_SKIP_MESSAGE,
+  codexModelForLogin,
+  GEMINI_NO_MCP_SERVERS,
+  runAgentTask,
+  type AgentTask,
+} from '../../../src/services/agent-runner/run.js';
 import type { UsableAgent } from '../../../src/services/agent-runner/detect.js';
 
 class FakeStream extends EventEmitter {
@@ -61,9 +69,16 @@ function task(cwd: string, inlineCalls: string[] = [], models: Record<string, un
  /** runAgentTask with `spawn` installed as child_process.spawn for the run. */
 function runTask(agentTask: AgentTask, { spawn: fake, ...overrides }: { spawn: typeof spawn } & Parameters<typeof runAgentTask>[1]) {
   setFakeSpawn(fake);
-  return runAgentTask(agentTask, { platform: () => 'linux', ...overrides });
+  return runAgentTask(agentTask, {
+    platform: () => 'linux',
+    codexVersion: async () => 'codex-cli test-1',
+    ...overrides,
+  });
 }
-afterEach(() => setFakeSpawn(null));
+afterEach(() => {
+  setFakeSpawn(null);
+  clearCodexWindowsConfinementMemory();
+});
 
 const neverQuery = (() => { throw new Error('query must not run'); }) as never;
 const env = async () => ({ PATH: '/bin', CLAUDE_MEM_INTERNAL: '1' });
@@ -312,12 +327,202 @@ describe('agent runner', () => {
       expect(result).toMatchObject({ state: 'ok', agent: 'gemini' });
       expect(result.attempts).toHaveLength(1);
       expect(result.attempts[0]).toMatchObject({ agent: 'codex' });
-      expect(result.attempts[0].error).toMatch(/Windows unelevated sandbox cannot enforce the required read restrictions/i);
+      expect(result.attempts[0].error).toBe(CODEX_WINDOWS_CONFINEMENT_SETUP_MESSAGE);
       expect(result.attempts[0].error).toMatch(/elevated sandbox or a supported MXC/i);
       expect(calls.map(call => call.command)).toEqual([CODEX_PATH, '/bin/gemini']);
       expect(calls[0].args).toContain('permissions.claude-mem-refresh.network.enabled=false');
       expect(calls[0].args.find(arg => arg.startsWith('permissions.claude-mem-refresh.filesystem='))).toContain('":root"="deny"');
     } finally { rmSync(cwd, { recursive: true, force: true }); }
+  });
+
+  describe('Windows Codex unelevated confinement memory (#5163)', () => {
+    const unelevatedRefusal = 'windows unelevated restricted-token sandbox cannot enforce split filesystem read restrictions directly; refusing to run unsandboxed';
+    const otherFailure = 'ERROR: stream disconnected before sandbox check';
+
+    function unelevatedSpawn(calls: SpawnCall[]) {
+      return fakeSpawn(calls, call => {
+        if (call.command === CODEX_PATH) {
+          // Only `codex exec` should appear; `--version` is injected in tests.
+          expect(call.args[0]).toBe('exec');
+          call.child.stderr.emit('data', unelevatedRefusal);
+          call.child.emit('close', 1);
+          return;
+        }
+        call.child.stdout.emit('data', JSON.stringify({ response: '{"ok":"gemini"}' }));
+        call.child.emit('close', 0);
+      });
+    }
+
+    it('after the first matching refusal, a second refresh runs no codex exec and falls through', async () => {
+      const cwd = mkdtempSync(join(tmpdir(), 'agent-runner-windows-skip-'));
+      try {
+        const calls: SpawnCall[] = [];
+        const spawnImpl = unelevatedSpawn(calls);
+        const versions = async () => 'codex-cli 0.154.0';
+        const first = await runTask(task(cwd), {
+          detect: async () => agents('codex', 'gemini'), query: neverQuery, spawn: spawnImpl, buildEnv: env,
+          platform: () => 'win32', codexVersion: versions,
+        });
+        expect(first).toMatchObject({ state: 'ok', agent: 'gemini' });
+        expect(calls.filter(call => call.command === CODEX_PATH && call.args[0] === 'exec')).toHaveLength(1);
+        expect(first.attempts[0].error).toBe(CODEX_WINDOWS_CONFINEMENT_SETUP_MESSAGE);
+
+        const secondCalls: SpawnCall[] = [];
+        const secondSpawn = unelevatedSpawn(secondCalls);
+        const second = await runTask(task(cwd), {
+          detect: async () => agents('codex', 'gemini'), query: neverQuery, spawn: secondSpawn, buildEnv: env,
+          platform: () => 'win32', codexVersion: versions,
+        });
+        expect(second).toMatchObject({ state: 'ok', agent: 'gemini' });
+        expect(second.attempts).toEqual([]);
+        expect(secondCalls.filter(call => call.command === CODEX_PATH)).toEqual([]);
+        expect(secondCalls.map(call => call.command)).toEqual(['/bin/gemini']);
+      } finally { rmSync(cwd, { recursive: true, force: true }); }
+    });
+
+    it('a different error does not remember Codex, so the next refresh still runs codex exec', async () => {
+      const cwd = mkdtempSync(join(tmpdir(), 'agent-runner-windows-other-err-'));
+      try {
+        const firstCalls: SpawnCall[] = [];
+        const firstSpawn = fakeSpawn(firstCalls, call => {
+          if (call.command === CODEX_PATH) {
+            call.child.stderr.emit('data', otherFailure);
+            call.child.emit('close', 1);
+            return;
+          }
+          call.child.stdout.emit('data', JSON.stringify({ response: '{"ok":"gemini"}' }));
+          call.child.emit('close', 0);
+        });
+        const first = await runTask(task(cwd), {
+          detect: async () => agents('codex', 'gemini'), query: neverQuery, spawn: firstSpawn, buildEnv: env,
+          platform: () => 'win32', codexVersion: async () => 'codex-cli 0.154.0',
+        });
+        expect(first.state).toBe('ok');
+        expect(first.attempts[0].error).toMatch(/codex exec exited 1/);
+        expect(first.attempts[0].error).not.toBe(CODEX_WINDOWS_CONFINEMENT_SETUP_MESSAGE);
+
+        const secondCalls: SpawnCall[] = [];
+        const secondSpawn = unelevatedSpawn(secondCalls);
+        const second = await runTask(task(cwd), {
+          detect: async () => agents('codex', 'gemini'), query: neverQuery, spawn: secondSpawn, buildEnv: env,
+          platform: () => 'win32', codexVersion: async () => 'codex-cli 0.154.0',
+        });
+        expect(second).toMatchObject({ state: 'ok', agent: 'gemini' });
+        expect(secondCalls.filter(call => call.command === CODEX_PATH && call.args[0] === 'exec')).toHaveLength(1);
+      } finally { rmSync(cwd, { recursive: true, force: true }); }
+    });
+
+    it('a remembered version A does not skip when Codex reports version B', async () => {
+      const cwd = mkdtempSync(join(tmpdir(), 'agent-runner-windows-version-'));
+      try {
+        const firstCalls: SpawnCall[] = [];
+        const first = await runTask(task(cwd), {
+          detect: async () => agents('codex', 'gemini'), query: neverQuery, spawn: unelevatedSpawn(firstCalls), buildEnv: env,
+          platform: () => 'win32', codexVersion: async () => 'codex-cli 0.154.0',
+        });
+        expect(first.agent).toBe('gemini');
+        expect(firstCalls.filter(call => call.command === CODEX_PATH && call.args[0] === 'exec')).toHaveLength(1);
+
+        const secondCalls: SpawnCall[] = [];
+        const second = await runTask(task(cwd), {
+          detect: async () => agents('codex', 'gemini'), query: neverQuery, spawn: unelevatedSpawn(secondCalls), buildEnv: env,
+          platform: () => 'win32', codexVersion: async () => 'codex-cli 0.200.0',
+        });
+        expect(second.agent).toBe('gemini');
+        // New version is not remembered, so exec runs once more and refuses again.
+        expect(secondCalls.filter(call => call.command === CODEX_PATH && call.args[0] === 'exec')).toHaveLength(1);
+      } finally { rmSync(cwd, { recursive: true, force: true }); }
+    });
+
+    it('a remembered executable path does not skip a different Codex path', async () => {
+      const cwd = mkdtempSync(join(tmpdir(), 'agent-runner-windows-path-'));
+      const otherCodex = join(realpathSync(tmpdir()), 'agent-runner-tools', 'codex-other');
+      try {
+        const firstCalls: SpawnCall[] = [];
+        await runTask(task(cwd), {
+          detect: async () => agents('codex', 'gemini'), query: neverQuery, spawn: unelevatedSpawn(firstCalls), buildEnv: env,
+          platform: () => 'win32', codexVersion: async () => 'codex-cli 0.154.0',
+        });
+
+        const secondCalls: SpawnCall[] = [];
+        const secondSpawn = fakeSpawn(secondCalls, call => {
+          if (call.command === otherCodex) {
+            expect(call.args[0]).toBe('exec');
+            call.child.stderr.emit('data', unelevatedRefusal);
+            call.child.emit('close', 1);
+            return;
+          }
+          call.child.stdout.emit('data', JSON.stringify({ response: '{"ok":"gemini"}' }));
+          call.child.emit('close', 0);
+        });
+        const otherAgents: UsableAgent[] = [
+          { id: 'codex', path: otherCodex, authenticated: true, reason: 'test' },
+          { id: 'gemini', path: '/bin/gemini', authenticated: true, reason: 'test' },
+        ];
+        const second = await runTask(task(cwd), {
+          detect: async () => otherAgents, query: neverQuery, spawn: secondSpawn, buildEnv: env,
+          platform: () => 'win32', codexVersion: async () => 'codex-cli 0.154.0',
+        });
+        expect(second.agent).toBe('gemini');
+        expect(secondCalls.filter(call => call.command === otherCodex && call.args[0] === 'exec')).toHaveLength(1);
+      } finally { rmSync(cwd, { recursive: true, force: true }); }
+    });
+
+    it('shows the setup message only once per remembered key', async () => {
+      const cwd = mkdtempSync(join(tmpdir(), 'agent-runner-windows-setup-once-'));
+      const setupLogs: string[] = [];
+      const { logger } = await import('../../../src/utils/logger.js');
+      const originalWarn = logger.warn.bind(logger);
+      logger.warn = ((tag: string, message: string, ...rest: unknown[]) => {
+        if (message === CODEX_WINDOWS_CONFINEMENT_SETUP_MESSAGE) setupLogs.push(message);
+        return originalWarn(tag, message, ...rest);
+      }) as typeof logger.warn;
+      try {
+        const versions = async () => 'codex-cli 0.154.0';
+        const firstCalls: SpawnCall[] = [];
+        await runTask(task(cwd), {
+          detect: async () => agents('codex', 'gemini'), query: neverQuery, spawn: unelevatedSpawn(firstCalls), buildEnv: env,
+          platform: () => 'win32', codexVersion: versions,
+        });
+        expect(setupLogs).toEqual([CODEX_WINDOWS_CONFINEMENT_SETUP_MESSAGE]);
+
+        const secondCalls: SpawnCall[] = [];
+        await runTask(task(cwd), {
+          detect: async () => agents('codex', 'gemini'), query: neverQuery, spawn: unelevatedSpawn(secondCalls), buildEnv: env,
+          platform: () => 'win32', codexVersion: versions,
+        });
+        expect(setupLogs).toEqual([CODEX_WINDOWS_CONFINEMENT_SETUP_MESSAGE]);
+        expect(secondCalls.filter(call => call.command === CODEX_PATH)).toEqual([]);
+      } finally {
+        logger.warn = originalWarn;
+        rmSync(cwd, { recursive: true, force: true });
+      }
+    });
+
+    it('when only Codex is available after a remembered refusal, returns waiting-for-agent without exec', async () => {
+      const cwd = mkdtempSync(join(tmpdir(), 'agent-runner-windows-only-codex-'));
+      try {
+        const versions = async () => 'codex-cli 0.154.0';
+        const firstCalls: SpawnCall[] = [];
+        await runTask(task(cwd), {
+          detect: async () => agents('codex', 'gemini'), query: neverQuery, spawn: unelevatedSpawn(firstCalls), buildEnv: env,
+          platform: () => 'win32', codexVersion: versions,
+        });
+
+        const secondCalls: SpawnCall[] = [];
+        const second = await runTask(task(cwd), {
+          detect: async () => agents('codex'), query: neverQuery, spawn: unelevatedSpawn(secondCalls), buildEnv: env,
+          platform: () => 'win32', codexVersion: versions,
+        });
+        expect(second).toMatchObject({
+          state: 'waiting-for-agent',
+          agent: null,
+          error: CODEX_WINDOWS_CONFINEMENT_SKIP_MESSAGE,
+          attempts: [],
+        });
+        expect(secondCalls).toEqual([]);
+      } finally { rmSync(cwd, { recursive: true, force: true }); }
+    });
   });
 
   it('Gemini: gemini -p in plan (read-only) mode, never --skip-trust, no extensions or MCP servers, JSON output, prompt on stdin', async () => {

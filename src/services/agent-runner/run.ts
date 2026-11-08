@@ -37,7 +37,26 @@ import { buildIsolatedEnvWithFreshOAuth } from '../../shared/EnvManager.js';
 import { sanitizeEnv } from '../../supervisor/env-sanitizer.js';
 import { logger } from '../../utils/logger.js';
 import { runtimeReadRoots } from './runtime-read-roots.js';
+import {
+  CODEX_UNELEVATED_SPLIT_FS_REFUSAL,
+  CODEX_WINDOWS_CONFINEMENT_SETUP_MESSAGE,
+  CODEX_WINDOWS_CONFINEMENT_SKIP_MESSAGE,
+  clearCodexWindowsConfinementMemory,
+  codexWindowsConfinementKey,
+  hasRememberedCodexUnableToConfine,
+  isCodexRememberedUnableToConfine,
+  parseCodexVersionOutput,
+  rememberCodexUnableToConfine,
+} from './codex-windows-confinement.js';
 import { detectUsableAgents, GEMINI_NO_MCP_SERVERS, runCommand, type CommandResult, type UsableAgent, type UsableAgentId } from './detect.js';
+
+export {
+  CODEX_UNELEVATED_SPLIT_FS_REFUSAL,
+  CODEX_WINDOWS_CONFINEMENT_SETUP_MESSAGE,
+  CODEX_WINDOWS_CONFINEMENT_SKIP_MESSAGE,
+  clearCodexWindowsConfinementMemory,
+  codexWindowsConfinementKey,
+};
 
 /** The model one step runs on: a Claude Code alias, a Codex model id (with reasoning effort) or a Gemini alias.
  * A missing entry or field leaves that CLI's own default. */
@@ -107,6 +126,8 @@ export interface AgentRunnerDependencies {
   buildEnv: () => Promise<NodeJS.ProcessEnv>;
   /** Runtime platform, injectable so the Windows confinement gate is regression-testable. */
   platform: () => NodeJS.Platform;
+  /** `codex --version` for the confinement memory key; injectable so tests need no real Codex. */
+  codexVersion: (executable: string, env: NodeJS.ProcessEnv) => Promise<string>;
 }
 
 async function defaultEnv(): Promise<NodeJS.ProcessEnv> {
@@ -115,11 +136,17 @@ async function defaultEnv(): Promise<NodeJS.ProcessEnv> {
   return { ...sanitizeEnv(await buildIsolatedEnvWithFreshOAuth()), CLAUDE_MEM_INTERNAL: '1' };
 }
 
+async function defaultCodexVersion(executable: string, env: NodeJS.ProcessEnv): Promise<string> {
+  const result = await runCommand(executable, ['--version'], { env });
+  return parseCodexVersionOutput(result.stdout, result.stderr);
+}
+
 const defaultDependencies: AgentRunnerDependencies = {
   detect: () => detectUsableAgents(),
   query,
   buildEnv: defaultEnv,
   platform: () => process.platform,
+  codexVersion: defaultCodexVersion,
 };
 
 const describeError = (error: unknown) => (error instanceof Error ? error.message : String(error)).trim() || 'unknown error';
@@ -286,9 +313,17 @@ function codexAsk(agent: UsableAgent, task: AgentTask, dependencies: AgentRunner
       if (result.exitCode !== 0) {
         // Recognize the actual capability refusal rather than disabling Codex
         // on every Windows machine: elevated/MXC installations may support it.
+        // Remember this executable+version for the worker process so later refreshes
+        // skip a doomed `codex exec` without loosening claude-mem-refresh (#5163).
         if (dependencies.platform() === 'win32'
-          && /unelevated restricted-token sandbox cannot enforce split filesystem read restrictions/i.test(`${result.stderr}\n${result.stdout}`)) {
-          throw new Error('Codex refused this refresh because its Windows unelevated sandbox cannot enforce the required read restrictions. Use an administrator-provisioned elevated sandbox or a supported MXC sandbox. The existing provider fallback remains available; filesystem restrictions were preserved.');
+          && CODEX_UNELEVATED_SPLIT_FS_REFUSAL.test(`${result.stderr}\n${result.stdout}`)) {
+          const version = await dependencies.codexVersion(executable, env);
+          const key = codexWindowsConfinementKey(executable, version);
+          const { showSetupMessage } = rememberCodexUnableToConfine(key);
+          if (showSetupMessage) {
+            logger.warn('WORKER', CODEX_WINDOWS_CONFINEMENT_SETUP_MESSAGE, { executable, version });
+          }
+          throw new Error(CODEX_WINDOWS_CONFINEMENT_SETUP_MESSAGE);
         }
         throw failure('codex exec', result);
       }
@@ -362,7 +397,22 @@ export async function runAgentTask(task: AgentTask, overrides: Partial<AgentRunn
     logger.warn('WORKER', `Agent run (${task.reason}) could not prepare its input`, { error: message });
     return { state: 'failed', agent: null, result: null, error: `Preparing the run failed: ${message}`, attempts };
   }
+  let skippedRememberedCodex = false;
   for (const agent of usable) {
+    if (agent.id === 'codex' && agent.path && hasRememberedCodexUnableToConfine()) {
+      // Cheap pre-check only after at least one remembered refusal: avoid `codex --version`
+      // on every healthy run, and skip a doomed `codex exec` once this machine is known bad.
+      const env = await dependencies.buildEnv();
+      const executable = realPath(agent.path);
+      const version = await dependencies.codexVersion(executable, env);
+      const key = codexWindowsConfinementKey(executable, version);
+      if (isCodexRememberedUnableToConfine(key)) {
+        skippedRememberedCodex = true;
+        logger.info('WORKER', `Agent run (${task.reason}) skipping Codex: remembered Windows unelevated sandbox cannot confine this executable and version`, { executable, version });
+        // Not a failed run: fall through to the existing provider fallback without re-showing setup.
+        continue;
+      }
+    }
     logger.info('WORKER', `Agent run (${task.reason}) starting on ${agent.id}`);
     try {
       const ask = { 'claude-code': claudeCodeAsk, codex: codexAsk, gemini: geminiAsk }[agent.id](agent, task, dependencies);
@@ -382,6 +432,15 @@ export async function runAgentTask(task: AgentTask, overrides: Partial<AgentRunn
         break;
       }
     }
+  }
+  if (!attempts.length && skippedRememberedCodex) {
+    return {
+      state: 'waiting-for-agent',
+      agent: null,
+      result: null,
+      error: CODEX_WINDOWS_CONFINEMENT_SKIP_MESSAGE,
+      attempts,
+    };
   }
   const last = attempts[attempts.length - 1];
   // Every agent's failure, in the order tried: the last fallback's error alone hides why the first ones failed.
